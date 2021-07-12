@@ -1,0 +1,359 @@
+---
+title: "Modeling_CODE"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    fig_width: 14
+    fig_height: 10
+    fig.align : 'center'
+    toc: yes
+    number_sections : yes
+    code_folding: show
+    keep_md: true
+---
+
+<hr>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message=FALSE,warning=FALSE)
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+
+# Load package
+```{r}
+rm(list=ls())
+
+#load packages
+library(knitr)
+library(tidyverse)
+library(magrittr)
+library(tidymodels)
+library(caret)
+
+options(scipen=999) # turn-off scientific notation like 1e+48
+options(tibble.width = Inf)
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+
+# Import Data 
+```{r}
+train <- read_csv("train_new.csv")
+train_wj <- read_csv("train_wj.csv")
+test <- read_csv("test_new.csv")
+test_wj <- read_csv("test_wj.csv")
+
+train <- train %>% 
+  cbind(train_wj %>% select(New_lunch:Dinner_Shrimp))
+
+test <- test %>% 
+  cbind(test_wj %>% select(New_lunch:Dinner_Shrimp))
+
+submission <- read_csv("data/sample_submission.csv")
+
+rm(train_wj, test_wj)
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+
+# Modeling
+
+## N_lunch
+
+```{r}
+# Initial Train-Test Split – rsample
+set.seed(2021)
+train_split <- initial_split(train, prop = 0.80, breaks = N_lunch)
+
+training_set <- train_split %>% training()
+testing_set <- train_split %>% testing()
+
+train_recipe <- training_set %>% 
+  recipe(N_lunch ~ .) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_dinner) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  step_string2factor(all_nominal())
+
+train_recipe_xg <- training_set %>% 
+  recipe(N_lunch ~ .) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_dinner) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  step_string2factor(all_nominal()) %>% 
+  step_dummy(all_nominal()) 
+
+set.seed(2021)
+cv_folds <- training_set %>% vfold_cv(v = 5, breaks = N_lunch)
+
+
+# Linear Regression
+lm_model_set <- linear_reg(
+  mode = "regression", 
+) %>%
+  set_engine("lm")
+
+lm_cv_results <- tune_grid(object = lm_model_set,
+                           preprocessor = train_recipe,
+                           resamples = cv_folds,
+                           metrics = metric_set(mae))
+
+lm_cv_results %>% show_best() # 69.5
+
+all_cores <- parallel::detectCores(logical = FALSE)
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+# RandomForest
+# install.packages("randomForest")
+library(randomForest)
+rf_model_set <- rand_forest(
+  mode = "regression",
+  trees = 500,
+  mtry = tune()
+) %>%  
+  set_engine("randomForest")
+
+# Hyperparameter tunning : grid search
+rf_params <- parameters(mtry(c(5,12)))
+rf_grid <- grid_regular(rf_params, levels = 8)
+
+rf_cv_results <- tune_grid(object = rf_model_set,
+                           preprocessor = train_recipe,
+                           resamples = cv_folds,
+                           grid = rf_grid,
+                           metrics = metric_set(mae))
+
+rf_cv_results %>% show_best() # mtry=11, CV mae=68.1
+
+
+# Xgboost
+library(xgboost)
+# Bayesian Optimization mtry & tree_depth & min_n
+xg_model_set <- boost_tree(
+  mode = "regression", 
+  trees = 500,
+  tree_depth = tune(),
+  mtry = tune(),
+  min_n = tune(),
+  learn_rate = 0.01
+) %>%
+  set_engine("xgboost")
+
+# Hyperparameter tunning : Bayesian Optimization
+xgboost_params <- parameters(tree_depth(c(5,15)), mtry(c(5,12)), min_n(c(8,15)))
+
+bayes_cv_results <-
+  tune_bayes(
+    object = xg_model_set,
+    preprocessor = train_recipe_xg,
+    resamples = cv_folds,
+    # To use non-default parameter ranges
+    param_info = xgboost_params,
+    initial = 4,
+    iter = 30,
+    # How to measure performance?
+    metrics = metric_set(mae),
+    control = control_bayes(no_improve = 20, verbose = FALSE))
+
+# Find best hyperparameter
+bayes_cv_results %>% show_best() # mae=66.4
+bayes_cv_results %>% select_best("mae") # mtry=12, min_n=8, tree_depth=6
+
+
+# Final lunch model
+trainset_final <- train_recipe_xg %>% prep() %>% bake(training_set)
+validset_final <- train_recipe_xg %>% prep() %>% bake(testing_set)
+
+lunch_model <- boost_tree(
+  mode = "regression", 
+  trees = 500,
+  tree_depth = 6,
+  mtry = 12,
+  min_n = 8,
+  learn_rate = 0.01
+) %>%
+  set_engine("xgboost") %>% 
+  fit(N_lunch ~., data = trainset_final)
+
+# Evaluation with multiple metrics
+multi_metric <- metric_set(mae)
+
+lunch_model %>%
+  predict.model_fit(validset_final) %>%
+  mutate(.pred = round(.pred)) %>%
+  bind_cols(validset_final %>% select(N_lunch)) %>%
+  multi_metric(truth=N_lunch, estimate=.pred)
+# mae = 67.0
+
+testset_final <- train_recipe_xg %>% prep() %>% bake(test)
+
+predicted_lunch <- lunch_model %>%
+  predict.model_fit(testset_final) %>%
+  mutate(.pred = round(.pred)) %>% unlist()
+
+submission$`중식계` <- predicted_lunch
+
+# Importance plot
+library(vip) # importance variable plot
+vip(lunch_model,
+    aesthetics = list(fill = "olivedrab")) +
+  labs(title = "Xgboost Model Importance - type Prediction")
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+
+## N_dinner
+
+```{r}
+# Initial Train-Test Split – rsample
+set.seed(2021)
+train_split <- initial_split(train, prop = 0.80, breaks = N_dinner)
+
+training_set <- train_split %>% training()
+testing_set <- train_split %>% testing()
+
+train_recipe <- training_set %>% 
+  recipe(N_dinner ~ .) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_lunch) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>% 
+  step_string2factor(all_nominal())
+
+train_recipe_xg <- training_set %>% 
+  recipe(N_dinner ~ .) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_lunch) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>% 
+  step_string2factor(all_nominal()) %>% 
+  step_dummy(all_nominal()) 
+
+set.seed(2021)
+cv_folds <- training_set %>% vfold_cv(v = 5, breaks = N_dinner)
+
+
+# Linear Regression
+lm_model_set <- linear_reg(
+  mode = "regression", 
+) %>%
+  set_engine("lm")
+
+lm_cv_results <- tune_grid(object = lm_model_set,
+                           preprocessor = train_recipe,
+                           resamples = cv_folds,
+                           metrics = metric_set(mae))
+
+lm_cv_results %>% show_best() # 45.8
+
+all_cores <- parallel::detectCores(logical = FALSE)
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+# RandomForest
+# install.packages("randomForest")
+library(randomForest)
+rf_model_set <- rand_forest(
+  mode = "regression",
+  trees = 500,
+  mtry = tune()
+) %>%  
+  set_engine("randomForest")
+
+# Hyperparameter tunning : grid search
+rf_params <- parameters(mtry(c(5,12)))
+rf_grid <- grid_regular(rf_params, levels = 8)
+
+rf_cv_results <- tune_grid(object = rf_model_set,
+                           preprocessor = train_recipe,
+                           resamples = cv_folds,
+                           grid = rf_grid,
+                           metrics = metric_set(mae))
+
+rf_cv_results %>% show_best() # mtry=12, CV mae=43.3
+
+
+# Xgboost
+library(xgboost)
+# Bayesian Optimization mtry & tree_depth & min_n
+xg_model_set <- boost_tree(
+  mode = "regression", 
+  trees = 500,
+  tree_depth = tune(),
+  mtry = tune(),
+  min_n = tune(),
+  learn_rate = 0.01
+) %>%
+  set_engine("xgboost")
+
+# Hyperparameter tunning : Bayesian Optimization
+xgboost_params <- parameters(tree_depth(c(8,15)), mtry(c(5,12)), min_n(c(5,9)))
+
+bayes_cv_results <-
+  tune_bayes(
+    object = xg_model_set,
+    preprocessor = train_recipe_xg,
+    resamples = cv_folds,
+    # To use non-default parameter ranges
+    param_info = xgboost_params,
+    initial = 4,
+    iter = 30,
+    # How to measure performance?
+    metrics = metric_set(mae),
+    control = control_bayes(no_improve = 20, verbose = FALSE))
+
+# Find best hyperparameter
+bayes_cv_results %>% show_best() # mae=45.9
+bayes_cv_results %>% select_best("mae") # mtry=12, min_n=9, tree_depth=11
+
+
+# Final dinner model
+trainset_final <- train_recipe %>% prep() %>% bake(training_set)
+validset_final <- train_recipe %>% prep() %>% bake(testing_set)
+
+dinner_model <- rand_forest(
+  mode = "regression",
+  mtry = 12,
+  trees = 500
+) %>% set_engine("randomForest") %>%
+  fit(N_dinner ~., data = trainset_final)
+
+dinner_model %>%
+  predict.model_fit(validset_final) %>%
+  mutate(.pred = round(.pred)) %>% 
+  bind_cols(validset_final %>% select(N_dinner)) %>%
+  multi_metric(truth=N_dinner, estimate=.pred)
+# mae = 42.5
+
+testset_final <- train_recipe %>% prep() %>% bake(test)
+
+predicted_dinner <- dinner_model %>%
+  predict.model_fit(testset_final) %>%
+  mutate(.pred = round(.pred)) %>% unlist()
+
+submission$`석식계` <- predicted_dinner
+
+# Importance plot
+library(vip) # importance variable plot
+vip(dinner_model,
+    aesthetics = list(fill = "olivedrab")) +
+  labs(title = "RandomForest Model Importance - type Prediction")
+
+submission %>% fwrite("submission_0712_second.csv")
+
+```
+
