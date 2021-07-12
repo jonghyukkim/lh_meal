@@ -74,13 +74,13 @@ testing_set <- train_split %>% testing()
 
 train_recipe <- training_set %>% 
   recipe(N_lunch ~ .) %>%
-  step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>%
   step_scale(all_numeric(), -all_outcomes()) %>%
   step_string2factor(all_nominal())
 
 train_recipe_xg <- training_set %>% 
   recipe(N_lunch ~ .) %>%
-  step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>%
   step_scale(all_numeric(), -all_outcomes()) %>%
   step_string2factor(all_nominal()) %>% 
   step_dummy(all_nominal()) 
@@ -100,7 +100,7 @@ lm_cv_results <- fit_resamples(object = lm_model_set,
                                resamples = cv_folds,
                                metrics = metric_set(mae))
 
-lm_cv_results %>% show_best() # 70.1
+lm_cv_results %>% show_best() # 77.3
 
 all_cores <- parallel::detectCores(logical = FALSE)
 library(doParallel)
@@ -112,7 +112,7 @@ registerDoParallel(cl)
 library(randomForest)
 rf_model_set <- rand_forest(
   mode = "regression",
-  trees = 300,
+  trees = 500,
   mtry = tune()
 ) %>%  
   set_engine("randomForest")
@@ -127,7 +127,7 @@ rf_cv_results <- tune_grid(object = rf_model_set,
                            grid = rf_grid,
                            metrics = metric_set(mae))
 
-rf_cv_results %>% show_best() # mtry=12, CV mae=68.9
+rf_cv_results %>% show_best() # mtry=12, CV mae=74.9
 
 
 # Xgboost
@@ -135,7 +135,7 @@ library(xgboost)
 # Bayesian Optimization mtry & tree_depth & min_n
 xg_model_set <- boost_tree(
   mode = "regression", 
-  trees = 300,
+  trees = 500,
   tree_depth = tune(),
   mtry = tune(),
   min_n = tune(),
@@ -160,8 +160,8 @@ bayes_cv_results <-
     control = control_bayes(no_improve = 20, verbose = FALSE))
 
 # Find best hyperparameter
-bayes_cv_results %>% show_best() # mae=87.4
-bayes_cv_results %>% select_best("mae") # mtry=12, min_n=14, tree_depth=11
+bayes_cv_results %>% show_best() # mae=81.3
+bayes_cv_results %>% select_best("mae") # mtry=12, min_n=12, tree_depth=12
 
 
 # Final lunch model
@@ -181,7 +181,7 @@ validset_final <- train_recipe %>% prep() %>% bake(testing_set)
 
 lunch_model <- rand_forest(
   mode = "regression",
-  trees = 300,
+  trees = 500,
   mtry = 12
 ) %>%  
   set_engine("randomForest") %>% 
@@ -195,7 +195,7 @@ lunch_model %>%
   mutate(.pred = round(.pred)) %>%
   bind_cols(validset_final %>% select(N_lunch)) %>%
   multi_metric(truth=N_lunch, estimate=.pred)
-# mae = 67.3
+# mae = 74.1
 
 testset_final <- train_recipe %>% prep() %>% bake(test)
 
@@ -229,13 +229,13 @@ testing_set <- train_split %>% testing()
 
 train_recipe <- training_set %>% 
   recipe(N_dinner ~ .) %>%
-  step_rm(Date, Breakfast, Lunch, Dinner, N_lunch, Rate_lunch, Rate_dinner) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_lunch, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>%
   step_scale(all_numeric(), -all_outcomes()) %>% 
   step_string2factor(all_nominal())
 
 train_recipe_xg <- training_set %>% 
   recipe(N_dinner ~ .) %>%
-  step_rm(Date, Breakfast, Lunch, Dinner, N_lunch, Rate_lunch, Rate_dinner) %>%
+  step_rm(Date, Breakfast, Lunch, Dinner, N_lunch, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>%
   step_scale(all_numeric(), -all_outcomes()) %>% 
   step_string2factor(all_nominal()) %>% 
   step_dummy(all_nominal()) 
@@ -255,7 +255,7 @@ lm_cv_results <- tune_grid(object = lm_model_set,
                            resamples = cv_folds,
                            metrics = metric_set(mae))
 
-lm_cv_results %>% show_best() # 46.2
+lm_cv_results %>% show_best() # 71.6
 
 all_cores <- parallel::detectCores(logical = FALSE)
 library(doParallel)
@@ -267,7 +267,7 @@ registerDoParallel(cl)
 library(randomForest)
 rf_model_set <- rand_forest(
   mode = "regression",
-  trees = 300,
+  trees = 500,
   mtry = tune()
 ) %>%  
   set_engine("randomForest")
@@ -282,7 +282,7 @@ rf_cv_results <- tune_grid(object = rf_model_set,
                            grid = rf_grid,
                            metrics = metric_set(mae))
 
-rf_cv_results %>% show_best() # mtry=12, CV mae=44.0
+rf_cv_results %>% show_best() # mtry=12, CV mae=52.7
 
 
 # Xgboost
@@ -290,7 +290,7 @@ library(xgboost)
 # Bayesian Optimization mtry & tree_depth & min_n
 xg_model_set <- boost_tree(
   mode = "regression", 
-  trees = 300,
+  trees = 500,
   tree_depth = tune(),
   mtry = tune(),
   min_n = tune(),
@@ -315,7 +315,7 @@ bayes_cv_results <-
     control = control_bayes(no_improve = 20, verbose = FALSE))
 
 # Find best hyperparameter
-bayes_cv_results %>% show_best() # mae=57.6
+bayes_cv_results %>% show_best() # mae=57.5
 bayes_cv_results %>% select_best("mae") # mtry=12, min_n=9, tree_depth=8
 
 # Final dinner model
@@ -325,7 +325,7 @@ validset_final <- train_recipe %>% prep() %>% bake(testing_set)
 dinner_model <- rand_forest(
   mode = "regression",
   mtry = 12,
-  trees = 300
+  trees = 500
 ) %>% set_engine("randomForest") %>%
   fit(N_dinner ~., data = trainset_final)
 
@@ -334,7 +334,7 @@ dinner_model %>%
   mutate(.pred = round(.pred)) %>% 
   bind_cols(validset_final %>% select(N_dinner)) %>%
   multi_metric(truth=N_dinner, estimate=.pred)
-# mae = 43.5
+# mae = 51.5
 
 testset_final <- train_recipe %>% prep() %>% bake(test)
 
@@ -350,6 +350,6 @@ vip(dinner_model,
     aesthetics = list(fill = "olivedrab")) +
   labs(title = "RandomForest Model Importance - type Prediction")
 
-submission %>% fwrite("submission_0712_second.csv")
+submission %>% fwrite("submission_0712_third.csv")
 ```
 
