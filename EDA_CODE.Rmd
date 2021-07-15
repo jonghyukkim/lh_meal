@@ -1,0 +1,306 @@
+---
+title: "EDA_CODE"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    fig_width: 14
+    fig_height: 10
+    fig.align : 'center'
+    toc: yes
+    number_sections : yes
+    code_folding: show
+    keep_md: true
+---
+
+<hr>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message=FALSE,warning=FALSE)
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+
+# Load package
+
+```{r}
+rm(list=ls())
+
+#load packages
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(magrittr)
+library(DataExplorer)
+library(skimr)
+library(DT)
+library(gt)
+library(data.table)
+library(zoo)
+library(ggcorrplot)
+
+options(scipen=999) # turn-off scientific notation like 1e+48
+options(tibble.width = Inf)
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+
+# Import Data 
+
+* [데이터출처]
+
+  * 기상관측(ASOS): https://data.kma.go.kr/data/grnd/selectAsosRltmList.do?pgmNo=36 (활용x)
+  
+  * 황사관측(PM10): https://data.kma.go.kr/data/climate/selectDustRltmList.do?pgmNo=68 (활용x)
+  
+  * 공휴일(API): https://www.data.go.kr/iim/api/selectAPIAcountView.do
+
+```{r}
+# Dacon data
+train <- read_csv("data/train.csv")
+test <- read_csv("data/test.csv")
+# submission <- read_csv("data/sample_submission.csv")
+
+# # Weather
+# weather <- read_csv("data/OBS_ASOS_DD_20210708161107.csv", locale=locale('ko',encoding='euc-kr'))
+# 
+# # Fine dust
+# dust <- read_csv("data/OBS_부유분진_DD_20210708161541.csv", locale=locale('ko',encoding='euc-kr'))
+
+# Holiday
+holiday <- read_csv("data/holidays.csv")
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+
+# Data pre-processing
+
+```{r}
+train %<>% rename(
+  Date      = `일자`,
+  Dayofweek = `요일`,
+  Total     = `본사정원수`,
+  Vacation  = `본사휴가자수`,
+  Business  = `본사출장자수`,
+  Overtime  = `본사시간외근무명령서승인건수`,
+  Home      = `현본사소속재택근무자수`,
+  Breakfast = `조식메뉴`,
+  Lunch     = `중식메뉴`,
+  Dinner    = `석식메뉴`,
+  N_lunch   = `중식계`,
+  N_dinner  = `석식계`
+)
+
+test %<>% rename(
+  Date      = `일자`,
+  Dayofweek = `요일`,
+  Total     = `본사정원수`,
+  Vacation  = `본사휴가자수`,
+  Business  = `본사출장자수`,
+  Overtime  = `본사시간외근무명령서승인건수`,
+  Home      = `현본사소속재택근무자수`,
+  Breakfast = `조식메뉴`,
+  Lunch     = `중식메뉴`,
+  Dinner    = `석식메뉴`
+)
+
+# submission <- submission %>% 
+#   rename(Date = `일자`,
+#          Sum_lunch = `중식계`,
+#          Sum_dinner = `석식계`)
+
+# weather <- weather %>% 
+#   select(-`지점`, -`지점명`, -`일 최심신적설(cm)`) %>%  # 일 최심신적설(cm) 전부 결측값
+#   rename(Date = `일시`,
+#          Temperature = `평균기온(°C)`,
+#          Precipitation = `일강수량(mm)`,
+#          Humidity = `평균 상대습도(%)`) 
+# 
+# dust <- dust %>% 
+#   select(-`지점`, -`지점명`) %>% 
+#   rename(Date = `일시`,
+#          Dust_concentration = `일 미세먼지 농도(㎍/㎥)`)
+
+# 주말 리스트
+## 1년 일자를 생성하고 요일 표시하기
+# 시작일 지정
+start_date <- as.Date("2016-01-01")
+# 종료일 지정
+end_date <- as.Date("2021-06-30")
+
+# 일단위로 일련의 날짜 생성하기
+df <- data.frame(seq(as.Date(start_date), as.Date(end_date), by=1))
+names(df) <- "Date"
+df$Holiday_name <- weekdays(as.Date(df$Date))
+
+myweek = df[(df$Holiday_name == '토요일') | (df$Holiday_name == "일요일"), ]
+
+# Holiday feature (normal day:1, before holiday:2, after holiday:3, sandwichday:4)
+`%!in%` = Negate(`%in%`)
+
+sandwich_set <- holiday %>% 
+  rbind(myweek) %>% 
+  arrange(Date) %>% 
+  mutate(Before_holiday = ifelse(Holiday_name %!in% c("일요일"), Date-days(1), NA),
+         Before_holiday = as.Date(Before_holiday)) %>% 
+  mutate(After_holiday = ifelse(Holiday_name %!in% c("토요일"), Date+days(1), NA),
+         After_holiday = as.Date(After_holiday)) %>% 
+  mutate(interval = ymd(Date) - ymd(lag(Date))) %>% 
+  mutate(interval = as.numeric(interval)) %>% 
+  # filter(interval == 1 & lag(interval) == 1 | interval == 1 & lead(interval) == 1 | interval == 2) %>% 
+  mutate(Sandwich_day = ifelse(interval == 2, Date-days(1), NA)) %>% 
+  mutate(Sandwich_day = as.Date(Sandwich_day))
+
+before_holiday <- sandwich_set %>% 
+  select(Before_holiday, After_holiday, Sandwich_day) %>% 
+  gather(key = Holiday_feature, value = value, 1:3, na.rm = T) %>% 
+  filter(Holiday_feature == "Before_holiday") %>% 
+  select(Date = value, Before_holiday = Holiday_feature) %>% 
+  mutate(Before_holiday = 1)
+
+after_holiday <- sandwich_set %>% 
+  select(Before_holiday, After_holiday, Sandwich_day) %>% 
+  gather(key = Holiday_feature, value = value, 1:3, na.rm = T) %>% 
+  filter(Holiday_feature == "After_holiday") %>% 
+  select(Date = value, After_holiday = Holiday_feature) %>% 
+  mutate(After_holiday = 1)
+
+sandwich_day <- sandwich_set %>% 
+  select(Before_holiday, After_holiday, Sandwich_day) %>% 
+  gather(key = Holiday_feature, value = value, 1:3, na.rm = T) %>% 
+  filter(Holiday_feature == "Sandwich_day") %>% 
+  select(Date = value, Sandwich_day = Holiday_feature) %>% 
+  mutate(Sandwich_day = 1)
+
+# Join with train set and test set
+train_new <- train %>% 
+  left_join(before_holiday, by = "Date") %>% 
+  mutate(Before_holiday = ifelse(is.na(Before_holiday), 0, Before_holiday)) %>% 
+  left_join(after_holiday, by = "Date") %>% 
+  mutate(After_holiday = ifelse(is.na(After_holiday), 0, After_holiday)) %>% 
+  left_join(sandwich_day, by = "Date") %>% 
+  mutate(Sandwich_day = ifelse(is.na(Sandwich_day), 0, Sandwich_day))
+
+test_new <- test %>% 
+  left_join(before_holiday, by = "Date") %>% 
+  mutate(Before_holiday = ifelse(is.na(Before_holiday), 0, Before_holiday)) %>% 
+  left_join(after_holiday, by = "Date") %>% 
+  mutate(After_holiday = ifelse(is.na(After_holiday), 0, After_holiday)) %>% 
+  left_join(sandwich_day, by = "Date") %>% 
+  mutate(Sandwich_day = ifelse(is.na(Sandwich_day), 0, Sandwich_day))
+
+
+# mutate In_worker(possible people having meal)
+train_new %<>% 
+  mutate(Net_total = Total - (Vacation+Business+Home))
+
+test_new %<>% 
+  mutate(Net_total = Total - (Vacation+Business+Home))
+
+# train_new %>% write_csv("train_new.csv")
+# test_new %>% write_csv("test_new.csv")
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+
+# Data EDA
+
+```{r}
+train_new <- read_csv("train_new.csv")
+test_new <- read_csv("test_new.csv")
+
+# Missing check
+train_new %>% 
+  plot_missing(
+    missing_only = TRUE
+  )
+
+train_new %>% 
+  profile_missing()
+
+train_new %>% 
+  filter(is.na(Dinner))
+
+# Missing Imputation
+# train <- train %>% 
+#   mutate(Precipitation = ifelse(is.na(Precipitation), 0, Precipitation)) %>% 
+#   mutate(Temperature = ifelse(is.na(Temperature), (lag(Temperature)+lead(Temperature))/2, Temperature)) %>% 
+#   mutate(Humidity = ifelse(is.na(Humidity), (lag(Humidity)+lead(Humidity))/2, Humidity)) %>% 
+#   mutate(Dust_concentration = ifelse(is.na(Dust_concentration), na.approx(Dust_concentration), Dust_concentration))
+  # filter(!is.na(Dinner_menu))
+
+# Histogram
+train_new %>% 
+  plot_histogram()
+
+# Outlier check
+train_new %>% 
+  select(Vacation, Net_total, Overtime, Business, Home, Total, N_lunch, N_dinner) %>% 
+  gather(key = Feature, value = value, 1:8) %>% 
+  ggplot() + 
+  aes(x = Feature, y = value) +
+  geom_boxplot(fill = "#dee2e7") +
+  theme_bw() +
+  facet_wrap(vars(Feature), scales = "free")
+  
+train_new %>% 
+  filter(N_lunch <= quantile(N_lunch, .25) - IQR(N_lunch)*1.5)
+
+train_new %>% 
+  filter(N_dinner <= quantile(N_dinner, .25) - IQR(N_dinner)*1.5)
+
+# Correlation check
+cor_data <- train_new %>% 
+  select_if(is.numeric) %>% 
+  # na.omit() %>% 
+  cor() %>% 
+  round(3)
+
+ggcorrplot(corr = cor_data,
+           type = "lower",
+           lab = TRUE, 
+           title = "Correlation plot")
+
+# group Test
+library(moonBook)
+mytable(Before_holiday ~ N_lunch, train_new) # 공휴일 전날 점심 식사량이 적음
+mytable(Before_holiday ~ N_dinner, train_new) # 공휴일 전날 저녁 식사량이 적음
+
+mytable(After_holiday ~ N_lunch, train_new) # 공휴일 다음날 점심 식사량이 많음
+mytable(After_holiday ~ N_dinner, train_new) # 공휴일 다음날 저녁 식사량과는 유의한 차이 없음
+
+mytable(Sandwich_day ~ N_lunch, train_new) # 샌드위치데이날 점심 식사량이 적음
+mytable(Sandwich_day ~ N_dinner, train_new) # 샌드위치데이날 저녁 식사량이 적음
+
+# Trend check
+# train %>% 
+#   select(Date, Sum_lunch, Sum_dinner) %>% 
+#   gather(key = Type, value = Sum, 2:3) %>% 
+#   ggplot() +
+#   aes(x = Date, y = Sum, colour = Type) +
+#   geom_line(size = 1L) +
+#   scale_color_brewer(palette = "Dark2") +
+#   theme_minimal()
+```
+
+<hr>
+
+<div style="margin-bottom:60px;">
+</div>
+

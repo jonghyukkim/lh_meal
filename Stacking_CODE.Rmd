@@ -79,15 +79,12 @@ k_folds_data <- vfold_cv(training_set, v = 5)
 
 ### Define Pre-processing
 ```{r}
-pca_rec <- recipe(N_lunch ~ ., data = training_set) %>% 
+mlp_rec <- recipe(N_lunch ~ ., data = training_set) %>% 
   step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>% 
   step_nzv(all_predictors()) %>% 
-  step_corr(all_numeric(), -all_outcomes()) %>% 
-  step_lincomb(all_numeric(), -all_outcomes()) %>% 
   step_other(all_nominal()) %>% 
   step_normalize(all_numeric(), -all_outcomes()) %>% 
-  step_dummy(all_nominal()) %>% 
-  step_pca(all_predictors(), num_comp = 5)
+  step_dummy(all_nominal())
   
 spline_rec <- recipe(N_lunch ~ ., data = training_set) %>% 
   step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>% 
@@ -96,15 +93,12 @@ spline_rec <- recipe(N_lunch ~ ., data = training_set) %>%
   step_lincomb(all_numeric(), -all_outcomes()) %>% 
   step_rm(all_nominal()) %>% 
   step_bs(all_predictors()) %>% 
-  step_YeoJohnson(all_predictors())
+  step_YeoJohnson(all_predictors()) #  similar to the Box-Cox
 
 knn_rec <- recipe(N_lunch ~ ., data = training_set) %>% 
   step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>% 
   step_nzv(all_predictors()) %>% 
-  step_corr(all_numeric(), -all_outcomes()) %>% 
-  step_lincomb(all_numeric(), -all_outcomes()) %>% 
-  step_normalize(all_numeric(), -all_outcomes()) %>% 
-  step_scale(all_numeric(), -all_outcomes())
+  step_normalize(all_numeric(), -all_outcomes())
 
 tidy_rec <- recipe(N_lunch ~ ., data = training_set) %>% 
   step_rm(Date, Breakfast, Lunch, Dinner, N_dinner, Rate_lunch, Rate_dinner, Lunch_score, Dinner_score) %>% 
@@ -117,9 +111,9 @@ tidy_rec <- recipe(N_lunch ~ ., data = training_set) %>%
 
 ### Define Models
 ```{r}
-pca_regression_model <- linear_reg() %>% 
+mlp_model <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
   set_mode("regression") %>% 
-  set_engine("lm")
+  set_engine("nnet")
 
 spline_model <- linear_reg() %>% 
   set_mode("regression") %>% 
@@ -146,6 +140,10 @@ model_metrics <- metric_set(mae)
 
 ### Define Grids
 ```{r}
+set.seed(2021)
+
+mlp_grid <- grid_regular(parameters(mlp_model), levels = 3, filter = c(hidden_units > 1))
+
 knn_grid <- grid_regular(parameters(knn_model), levels = 7)
   
 randforest_grid <- grid_regular(parameters(randomForest_model), levels = 3, filter = c(trees > 1))
@@ -155,9 +153,9 @@ xgboost_grid <- grid_regular(parameters(xgboost_model), levels = 3, filter = c(t
 
 ### Define Workflows
 ```{r}
-pca_wf <- workflow() %>% 
-  add_model(pca_regression_model) %>% 
-  add_recipe(pca_rec)
+mlp_wf <- workflow() %>% 
+  add_model(mlp_model) %>% 
+  add_recipe(mlp_rec)
 
 spline_wf <- workflow() %>% 
   add_model(spline_model) %>% 
@@ -183,18 +181,20 @@ library(doParallel)
 cl <- makePSOCKcluster(all_cores)
 registerDoParallel(cl)
 
-pca_res <- fit_resamples(
-  pca_wf,
-  resamples = k_folds_data,
-  control = model_control,
-  metrics = model_metrics,
-)
 
 spline_res <- fit_resamples(
   spline_wf,
   resamples = k_folds_data,
   metrics = model_metrics,
   control = model_control
+)
+
+mlp_res <- tune_grid(
+  mlp_wf,
+  resamples = k_folds_data,
+  grid = mlp_grid,
+  control = model_control,
+  metrics = model_metrics,
 )
 
 knn_res <- tune_grid(
@@ -220,30 +220,22 @@ xgboost_res <- tune_grid(
   metrics = model_metrics,
   control = model_control
 )
+
 ```
 
 ```{r}
-load("stack.Rdata")
-```
-
-### Create Stacks Model
-```{r}
-ames_stack <- stacks() %>% 
-  add_candidates(pca_res) %>% 
-  add_candidates(spline_res) %>%
-  # add_candidates(knn_res) %>% 
-  add_candidates(randomForest_res) %>%
-  add_candidates(xgboost_res)
-
-ames_stack <- ames_stack %>% 
-  blend_predictions() %>% 
-  fit_members()
+save(spline_res, mlp_res, knn_res, randomForest_res, xgboost_res, file = "stackingModel.RData")
+# load("stack.Rdata")
 ```
 
 ### Self stacking
 
 #### Finalize parameters 
 ```{r}
+mlp_final_param <- mlp_res %>% show_best("mae") %>% 
+  slice(1) %>% 
+  select(hidden_units, penalty, epochs)
+
 knn_final_param <- knn_res %>% show_best("mae") %>% 
   slice(1) %>% 
   select(neighbors)
@@ -275,9 +267,10 @@ knn_stack <- knn_res %>%
   inner_join(knn_final_param) %>% 
   select(id, .row, knn = .pred)
 
-pca_stack <- pca_res %>% 
+mlp_stack <- mlp_res %>% 
   collect_predictions() %>% 
-  select(id, .row, pca = .pred)
+  inner_join(mlp_final_param) %>% 
+  select(id, .row, mlp = .pred)
 
 spline_stack <- spline_res %>%
   collect_predictions() %>% 
@@ -289,7 +282,7 @@ spline_stack <- spline_res %>%
 stack_df <- xgboost_stack %>% 
   left_join(randomForest_stack) %>% 
   left_join(knn_stack) %>% 
-  left_join(pca_stack) %>% 
+  left_join(mlp_stack) %>% 
   left_join(spline_stack) %>% 
   select(-id, -.row)
 
@@ -315,17 +308,18 @@ knn_wf <- knn_wf %>%
   finalize_workflow(knn_final_param) %>% 
   last_fit(train_split)
 
-pca_wf <- pca_wf %>% last_fit(train_split)
+mlp_wf <- mlp_wf %>% 
+  finalize_workflow(mlp_final_param) %>% 
+  last_fit(train_split)
 
 spline_wf <- spline_wf %>% last_fit(train_split)
 ```
 
 #### Extract Predictions from Submodels
 ```{r}
-stack_final_df <- tibble("model" = list(xgboost_wf, randomForest_wf, knn_wf, pca_wf, spline_wf),
-                         "model_names" = c("xgboost", "randomforest", "knn", "pca", "spline")) %>% 
+stack_final_df <- tibble("model" = list(xgboost_wf, randomForest_wf, knn_wf, mlp_wf, spline_wf),
+                         "model_names" = c("xgboost", "randomforest", "knn", "mlp", "spline")) %>% 
   mutate(pred = map(model, collect_predictions))
-
 
 stack_final_df <- stack_final_df %>% 
   select(model_names, pred) %>% 
@@ -343,6 +337,26 @@ predict(stack_model, stack_final_df) %>%
   ungroup() %>% 
   pivot_wider(names_from = .metric, values_from = .estimate) %>% 
   arrange(mae)
+```
+
+###  Predict test set
+```{r}
+
+```
+
+
+### Create Stacks Model using tidymodels
+```{r}
+# ames_stack <- stacks() %>% 
+#   add_candidates(pca_res) %>% 
+#   add_candidates(spline_res) %>%
+#   # add_candidates(knn_res) %>% 
+#   add_candidates(randomForest_res) %>%
+#   add_candidates(xgboost_res)
+# 
+# ames_stack <- ames_stack %>% 
+#   blend_predictions() %>% 
+#   fit_members()
 ```
 
 ```{r}
