@@ -341,7 +341,14 @@ predict(stack_model, stack_final_df) %>%
 
 ###  Predict test set
 ```{r}
+training_final <- spline_rec %>% prep() %>% bake(training_set)
 
+predicted_lunch <- lunch_model %>%
+  predict.model_fit(testset_final) %>%
+  mutate(.pred = round(.pred)) %>% unlist()
+
+spline_wf %>% 
+  fit(N_lunch ~ ., training_final)
 ```
 
 
@@ -353,7 +360,7 @@ predict(stack_model, stack_final_df) %>%
 #   # add_candidates(knn_res) %>% 
 #   add_candidates(randomForest_res) %>%
 #   add_candidates(xgboost_res)
-# 
+ 
 # ames_stack <- ames_stack %>% 
 #   blend_predictions() %>% 
 #   fit_members()
